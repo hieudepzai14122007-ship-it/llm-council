@@ -72,6 +72,30 @@
   margin-bottom: 4px;
 }
 
+.usage-summary {
+  padding: 12px 16px;
+  border-top: 1px solid #e0e0e0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #555;
+}
+
+.usage-summary-title {
+  font-weight: 600;
+  color: #333;
+  margin-bottom: 4px;
+}
+
+.usage-saved {
+  margin-top: 4px;
+  color: #2e7d4f;
+}
+
+.usage-muted {
+  margin-top: 4px;
+  color: #999;
+}
+
 .conversation-meta {
   color: #999;
   font-size: 12px;

@@ -62,6 +62,87 @@
   white-space: pre-wrap;
 }
 
+.laya-badge {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 14px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  color: #333;
+  border: 1px solid #e0e0e0;
+  background: #f9fafb;
+}
+
+.laya-badge.fast {
+  border-color: #b7e4c7;
+  background: #f0fbf4;
+}
+
+.laya-badge.solo {
+  border-color: #f3dfa2;
+  background: #fffbeb;
+}
+
+.laya-badge.council {
+  border-color: #d0e7ff;
+  background: #f5f9ff;
+}
+
+.laya-muted {
+  color: #888;
+}
+
+.usage-line {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #888;
+}
+
+.rerun-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  font-size: 13px;
+  color: #666;
+}
+
+.rerun-button {
+  padding: 6px 12px;
+  background: #fff;
+  border: 1px solid #d0d0d0;
+  border-radius: 6px;
+  color: #333;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.rerun-button:hover {
+  border-color: #4a90e2;
+  color: #4a90e2;
+}
+
+.send-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-self: flex-end;
+}
+
+.mode-select {
+  padding: 8px;
+  border: 1px solid #d0d0d0;
+  border-radius: 8px;
+  background: #fff;
+  color: #333;
+  font-size: 13px;
+  font-family: inherit;
+}
+
 .loading-indicator {
   display: flex;
   align-items: center;

@@ -1,11 +1,28 @@
-"""3-stage LLM Council orchestration."""
+﻿"""3-stage LLM Council orchestration, behind the Laya gatekeeper."""
 
-from typing import List, Dict, Any, Tuple
-from .openrouter import query_models_parallel, query_model
-from .config import COUNCIL_MODELS, CHAIRMAN_MODEL
+from typing import List, Dict, Any, Tuple, AsyncIterator
+import asyncio
+import time
+from .claude_cli import query_model
+from .config import (
+    CHAIRMAN_MODEL, FAST_MODEL, SOLO_MODEL, DOMAIN_COUNCILS,
+    HISTORY_TURNS, HISTORY_ANSWER_CHARS,
+)
+from . import laya_gate, usage
+
+JUDGE_PROMPT = "You are an impartial judge evaluating answers written by other experts."
 
 
-async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
+async def _query_members(members: List[Dict[str, Any]], messages, system_prompt=None):
+    """Query each council member in parallel, in its own role unless one is given."""
+    responses = await asyncio.gather(*[
+        query_model(m["model"], messages, system_prompt=system_prompt or m["system_prompt"])
+        for m in members
+    ])
+    return {m["id"]: r for m, r in zip(members, responses)}
+
+
+async def stage1_collect_responses(user_query: str, members: List[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """
     Stage 1: Collect individual responses from all council models.
 
@@ -17,8 +34,8 @@ async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
     """
     messages = [{"role": "user", "content": user_query}]
 
-    # Query all models in parallel
-    responses = await query_models_parallel(COUNCIL_MODELS, messages)
+    # Query all members in parallel, each in its role
+    responses = await _query_members(members or DOMAIN_COUNCILS["general"], messages)
 
     # Format results
     stage1_results = []
@@ -26,7 +43,8 @@ async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
         if response is not None:  # Only include successful responses
             stage1_results.append({
                 "model": model,
-                "response": response.get('content', '')
+                "response": response.get('content', ''),
+                "usage": response.get('usage')
             })
 
     return stage1_results
@@ -34,7 +52,8 @@ async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
 
 async def stage2_collect_rankings(
     user_query: str,
-    stage1_results: List[Dict[str, Any]]
+    stage1_results: List[Dict[str, Any]],
+    members: List[Dict[str, Any]] = None
 ) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
     """
     Stage 2: Each model ranks the anonymized responses.
@@ -94,8 +113,8 @@ Now provide your evaluation and ranking:"""
 
     messages = [{"role": "user", "content": ranking_prompt}]
 
-    # Get rankings from all council models in parallel
-    responses = await query_models_parallel(COUNCIL_MODELS, messages)
+    # Get rankings from all council members in parallel, as neutral judges
+    responses = await _query_members(members or DOMAIN_COUNCILS["general"], messages, system_prompt=JUDGE_PROMPT)
 
     # Format results
     stage2_results = []
@@ -106,7 +125,8 @@ Now provide your evaluation and ranking:"""
             stage2_results.append({
                 "model": model,
                 "ranking": full_text,
-                "parsed_ranking": parsed
+                "parsed_ranking": parsed,
+                "usage": response.get('usage')
             })
 
     return stage2_results, label_to_model
@@ -170,7 +190,8 @@ Provide a clear, well-reasoned final answer that represents the council's collec
 
     return {
         "model": CHAIRMAN_MODEL,
-        "response": response.get('content', '')
+        "response": response.get('content', ''),
+        "usage": response.get('usage')
     }
 
 
@@ -274,8 +295,8 @@ Title:"""
 
     messages = [{"role": "user", "content": title_prompt}]
 
-    # Use gemini-2.5-flash for title generation (fast and cheap)
-    response = await query_model("google/gemini-2.5-flash", messages, timeout=30.0)
+    # Use the fast model for title generation
+    response = await query_model(FAST_MODEL, messages, timeout=60.0)
 
     if response is None:
         # Fallback to a generic title
@@ -293,43 +314,147 @@ Title:"""
     return title
 
 
-async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
+MODES = ("auto",) + laya_gate.ROUTES
+
+
+async def laya_route(user_query: str, mode: str = "auto") -> Dict[str, Any]:
     """
-    Run the complete 3-stage council process.
+    Ask the Laya gatekeeper how to handle the query, and attach the chosen members.
 
     Args:
-        user_query: The user's question
-
-    Returns:
-        Tuple of (stage1_results, stage2_results, stage3_result, metadata)
+        user_query: The user's current message (without history; Laya reads ~500 tokens)
+        mode: "auto" to follow Laya, or "fast" / "solo" / "council" to override it
     """
-    # Stage 1: Collect individual responses
-    stage1_results = await stage1_collect_responses(user_query)
+    decision = await laya_gate.classify(user_query)
+    if mode != "auto" and mode != decision["route"]:
+        laya_gate.log_override(user_query, decision["route"], mode)
+        decision["laya_route"] = decision["route"]
+        decision["route"] = mode
+        decision["override"] = True
+    if decision["route"] == "fast":
+        decision["members"] = [FAST_MODEL]
+    elif decision["route"] == "solo":
+        decision["members"] = [SOLO_MODEL]
+    else:
+        decision["members"] = [m["id"] for m in DOMAIN_COUNCILS[decision["domain"]]]
+    return decision
 
-    # If no models responded successfully, return error
-    if not stage1_results:
-        return [], [], {
-            "model": "error",
-            "response": "All models failed to respond. Please try again."
-        }, {}
 
-    # Stage 2: Collect rankings
-    stage2_results, label_to_model = await stage2_collect_rankings(user_query, stage1_results)
+async def single_answer(query: str, route: str, domain: str) -> Dict[str, Any]:
+    """Answer with one model: the fast model, or the solo model in the topic's lead role."""
+    if route == "fast":
+        model, system_prompt = FAST_MODEL, None
+    else:
+        model, system_prompt = SOLO_MODEL, DOMAIN_COUNCILS[domain][0]["system_prompt"]
+    response = await query_model(model, [{"role": "user", "content": query}], system_prompt=system_prompt)
+    if response is None:
+        return {"model": model, "response": "Error: Unable to generate a response."}
+    return {"model": model, "response": response.get('content', ''), "usage": response.get('usage')}
 
-    # Calculate aggregate rankings
-    aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
 
-    # Stage 3: Synthesize final answer
-    stage3_result = await stage3_synthesize_final(
-        user_query,
-        stage1_results,
-        stage2_results
-    )
+def with_history(history: List[Dict[str, Any]], query: str) -> str:
+    """
+    Put the earlier conversation in front of the new question, so follow-ups make sense.
 
-    # Prepare metadata
-    metadata = {
-        "label_to_model": label_to_model,
-        "aggregate_rankings": aggregate_rankings
+    Args:
+        history: Stored conversation messages before this question
+        query: The new question
+    """
+    turns = []
+    pending_user = None
+    for msg in history:
+        if msg["role"] == "user":
+            pending_user = msg["content"]
+        elif pending_user is not None:
+            answer = ((msg.get("stage3") or {}).get("response") or "").strip()
+            if len(answer) > HISTORY_ANSWER_CHARS:
+                answer = answer[:HISTORY_ANSWER_CHARS] + " [...]"
+            turns.append((pending_user, answer))
+            pending_user = None
+    turns = turns[-HISTORY_TURNS:]
+    if not turns:
+        return query
+
+    earlier = "\n\n".join(f"User: {q}\n\nAssistant: {a}" for q, a in turns)
+    return f"""Conversation so far:
+
+{earlier}
+
+---
+
+Now answer the user's new message, using the conversation above as context:
+
+{query}"""
+
+
+async def run_turn(
+    user_query: str,
+    history: List[Dict[str, Any]] = None,
+    mode: str = "auto"
+) -> AsyncIterator[Tuple[str, Dict[str, Any]]]:
+    """
+    Answer one message: Laya gate, then the fast, solo or full council route.
+
+    Yields (event_type, payload) as each step finishes. The last event is "turn_result",
+    carrying everything needed to save the answer.
+    """
+    started = time.perf_counter()
+    laya = await laya_route(user_query, mode)
+    yield "laya_complete", {"data": laya}
+
+    query = with_history(history or [], user_query)
+    route = laya["route"]
+    stage1_results, stage2_results, metadata = [], [], {}
+
+    if route in ("fast", "solo"):
+        yield "stage3_start", {}
+        stage3_result = await single_answer(query, route, laya["domain"])
+        yield "stage3_complete", {"data": stage3_result}
+    else:
+        members = DOMAIN_COUNCILS[laya["domain"]]
+
+        yield "stage1_start", {}
+        stage1_results = await stage1_collect_responses(query, members)
+        yield "stage1_complete", {"data": stage1_results}
+
+        if not stage1_results:
+            stage3_result = {"model": "error", "response": "All models failed to respond. Please try again."}
+            yield "stage3_complete", {"data": stage3_result}
+        else:
+            yield "stage2_start", {}
+            stage2_results, label_to_model = await stage2_collect_rankings(query, stage1_results, members)
+            metadata = {
+                "label_to_model": label_to_model,
+                "aggregate_rankings": calculate_aggregate_rankings(stage2_results, label_to_model),
+            }
+            yield "stage2_complete", {"data": stage2_results, "metadata": metadata}
+
+            yield "stage3_start", {}
+            stage3_result = await stage3_synthesize_final(query, stage1_results, stage2_results)
+            yield "stage3_complete", {"data": stage3_result}
+
+    turn_usage = {
+        **usage.total(stage1_results, stage2_results, stage3_result),
+        "seconds": round(time.perf_counter() - started, 1),
+        "route": route,
+    }
+    usage.record(route, turn_usage, turn_usage["seconds"], bool(laya.get("override")))
+    yield "usage_complete", {"data": turn_usage}
+
+    yield "turn_result", {
+        "stage1": stage1_results,
+        "stage2": stage2_results,
+        "stage3": stage3_result,
+        "metadata": {**metadata, "laya": laya},
+        "laya": laya,
+        "usage": turn_usage,
     }
 
-    return stage1_results, stage2_results, stage3_result, metadata
+
+async def run_full_council(user_query: str, history=None, mode: str = "auto") -> Dict[str, Any]:
+    """Run one turn to completion and return its result (non-streaming)."""
+    result = {}
+    async for event_type, payload in run_turn(user_query, history, mode):
+        if event_type == "turn_result":
+            result = payload
+    return result

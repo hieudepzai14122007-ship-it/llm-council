@@ -4,13 +4,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Literal
 import uuid
 import json
 import asyncio
 
-from . import storage
-from .council import run_full_council, generate_conversation_title, stage1_collect_responses, stage2_collect_rankings, stage3_synthesize_final, calculate_aggregate_rankings
+from . import storage, usage
+from .council import run_turn, run_full_council, generate_conversation_title
 
 app = FastAPI(title="LLM Council API")
 
@@ -23,6 +23,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+Mode = Literal["auto", "fast", "solo", "council"]
+
 
 class CreateConversationRequest(BaseModel):
     """Request to create a new conversation."""
@@ -32,6 +34,12 @@ class CreateConversationRequest(BaseModel):
 class SendMessageRequest(BaseModel):
     """Request to send a message in a conversation."""
     content: str
+    mode: Mode = "auto"  # "auto" lets Laya decide; anything else overrides it
+
+
+class RerunRequest(BaseModel):
+    """Request to answer the last question again on a different route."""
+    mode: Mode
 
 
 class ConversationMetadata(BaseModel):
@@ -54,6 +62,12 @@ class Conversation(BaseModel):
 async def root():
     """Health check endpoint."""
     return {"status": "ok", "service": "LLM Council API"}
+
+
+@app.get("/api/usage")
+async def get_usage():
+    """Totals per route and estimated savings from Laya's routing."""
+    return usage.summary()
 
 
 @app.get("/api/conversations", response_model=List[ConversationMetadata])
@@ -79,109 +93,64 @@ async def get_conversation(conversation_id: str):
     return conversation
 
 
+def _save_answer(conversation_id: str, result: Dict[str, Any]):
+    storage.add_assistant_message(
+        conversation_id,
+        result["stage1"],
+        result["stage2"],
+        result["stage3"],
+        result["laya"],
+        result["usage"],
+        {k: v for k, v in result["metadata"].items() if k != "laya"},
+    )
+
+
 @app.post("/api/conversations/{conversation_id}/message")
 async def send_message(conversation_id: str, request: SendMessageRequest):
     """
-    Send a message and run the 3-stage council process.
+    Send a message and answer it (Laya gate, then fast / solo / council).
     Returns the complete response with all stages.
     """
-    # Check if conversation exists
     conversation = storage.get_conversation(conversation_id)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    # Check if this is the first message
-    is_first_message = len(conversation["messages"]) == 0
-
-    # Add user message
+    history = conversation["messages"]
     storage.add_user_message(conversation_id, request.content)
 
-    # If this is the first message, generate a title
-    if is_first_message:
+    if not history:
         title = await generate_conversation_title(request.content)
         storage.update_conversation_title(conversation_id, title)
 
-    # Run the 3-stage council process
-    stage1_results, stage2_results, stage3_result, metadata = await run_full_council(
-        request.content
-    )
-
-    # Add assistant message with all stages
-    storage.add_assistant_message(
-        conversation_id,
-        stage1_results,
-        stage2_results,
-        stage3_result
-    )
-
-    # Return the complete response with metadata
-    return {
-        "stage1": stage1_results,
-        "stage2": stage2_results,
-        "stage3": stage3_result,
-        "metadata": metadata
-    }
+    result = await run_full_council(request.content, history, request.mode)
+    _save_answer(conversation_id, result)
+    return result
 
 
-@app.post("/api/conversations/{conversation_id}/message/stream")
-async def send_message_stream(conversation_id: str, request: SendMessageRequest):
-    """
-    Send a message and stream the 3-stage council process.
-    Returns Server-Sent Events as each stage completes.
-    """
-    # Check if conversation exists
-    conversation = storage.get_conversation(conversation_id)
-    if conversation is None:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-
-    # Check if this is the first message
-    is_first_message = len(conversation["messages"]) == 0
+def _stream(conversation_id: str, content: str, history: List[Dict[str, Any]], mode: str, make_title: bool):
+    """Stream one turn as Server-Sent Events and save the answer at the end."""
 
     async def event_generator():
         try:
-            # Add user message
-            storage.add_user_message(conversation_id, request.content)
-
             # Start title generation in parallel (don't await yet)
-            title_task = None
-            if is_first_message:
-                title_task = asyncio.create_task(generate_conversation_title(request.content))
+            title_task = asyncio.create_task(generate_conversation_title(content)) if make_title else None
 
-            # Stage 1: Collect responses
-            yield f"data: {json.dumps({'type': 'stage1_start'})}\n\n"
-            stage1_results = await stage1_collect_responses(request.content)
-            yield f"data: {json.dumps({'type': 'stage1_complete', 'data': stage1_results})}\n\n"
+            result = None
+            async for event_type, payload in run_turn(content, history, mode):
+                if event_type == "turn_result":
+                    result = payload
+                else:
+                    yield f"data: {json.dumps({'type': event_type, **payload})}\n\n"
 
-            # Stage 2: Collect rankings
-            yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
-            stage2_results, label_to_model = await stage2_collect_rankings(request.content, stage1_results)
-            aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
-            yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}})}\n\n"
-
-            # Stage 3: Synthesize final answer
-            yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
-            stage3_result = await stage3_synthesize_final(request.content, stage1_results, stage2_results)
-            yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result})}\n\n"
-
-            # Wait for title generation if it was started
             if title_task:
                 title = await title_task
                 storage.update_conversation_title(conversation_id, title)
                 yield f"data: {json.dumps({'type': 'title_complete', 'data': {'title': title}})}\n\n"
 
-            # Save complete assistant message
-            storage.add_assistant_message(
-                conversation_id,
-                stage1_results,
-                stage2_results,
-                stage3_result
-            )
-
-            # Send completion event
+            _save_answer(conversation_id, result)
             yield f"data: {json.dumps({'type': 'complete'})}\n\n"
 
         except Exception as e:
-            # Send error event
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
 
     return StreamingResponse(
@@ -194,6 +163,39 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
     )
 
 
+@app.post("/api/conversations/{conversation_id}/message/stream")
+async def send_message_stream(conversation_id: str, request: SendMessageRequest):
+    """
+    Send a message and stream the answer as each step completes.
+    Earlier messages in the conversation are passed along, so follow-ups work.
+    """
+    conversation = storage.get_conversation(conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    history = conversation["messages"]
+    storage.add_user_message(conversation_id, request.content)
+    return _stream(conversation_id, request.content, history, request.mode, make_title=not history)
+
+
+@app.post("/api/conversations/{conversation_id}/rerun/stream")
+async def rerun_stream(conversation_id: str, request: RerunRequest):
+    """
+    Replace the last answer with a new one on a different route
+    ("Ask the council instead", "Just answer quickly", ...).
+    """
+    conversation = storage.get_conversation(conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    question = storage.remove_last_answer(conversation_id)
+    if question is None:
+        raise HTTPException(status_code=400, detail="The conversation doesn't end with an answer")
+
+    history = storage.get_conversation(conversation_id)["messages"][:-1]  # before the question
+    return _stream(conversation_id, question, history, request.mode, make_title=False)
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host="127.0.0.1", port=8001)

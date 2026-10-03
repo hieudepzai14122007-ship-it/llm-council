@@ -131,7 +131,10 @@ def add_assistant_message(
     conversation_id: str,
     stage1: List[Dict[str, Any]],
     stage2: List[Dict[str, Any]],
-    stage3: Dict[str, Any]
+    stage3: Dict[str, Any],
+    laya: Optional[Dict[str, Any]] = None,
+    usage: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None
 ):
     """
     Add an assistant message with all 3 stages to a conversation.
@@ -150,10 +153,33 @@ def add_assistant_message(
         "role": "assistant",
         "stage1": stage1,
         "stage2": stage2,
-        "stage3": stage3
+        "stage3": stage3,
+        "laya": laya,
+        "usage": usage,
+        "metadata": metadata
     })
 
     save_conversation(conversation)
+
+
+def remove_last_answer(conversation_id: str) -> Optional[str]:
+    """
+    Remove the last assistant message, so the question before it can be answered again.
+
+    Returns:
+        The question that was answered, or None if the conversation doesn't end in an answer
+    """
+    conversation = get_conversation(conversation_id)
+    if conversation is None:
+        raise ValueError(f"Conversation {conversation_id} not found")
+
+    messages = conversation["messages"]
+    if len(messages) < 2 or messages[-1]["role"] != "assistant" or messages[-2]["role"] != "user":
+        return None
+
+    messages.pop()
+    save_conversation(conversation)
+    return messages[-1]["content"]
 
 
 def update_conversation_title(conversation_id: str, title: str):

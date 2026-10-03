@@ -15,6 +15,9 @@ wheels/
 # Data files
 data/
 
+# Service logs written by start.ps1
+logs/
+
 # Frontend
 frontend/node_modules/
 frontend/dist/
