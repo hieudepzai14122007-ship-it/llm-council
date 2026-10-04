@@ -1,11 +1,33 @@
-import { useState, useEffect } from 'react';
 import './Sidebar.css';
+
+function UsageSummary({ usage }) {
+  if (!usage || usage.answers === 0) return null;
+  const r = usage.by_route;
+  return (
+    <div className="usage-summary">
+      <div className="usage-summary-title">Usage so far</div>
+      <div>
+        {usage.answers} answers: {r.fast.answers} quick · {r.solo.answers} expert · {r.council.answers} council
+      </div>
+      <div>{usage.calls} Claude calls · ≈ ${usage.cost_usd.toFixed(2)} at API prices</div>
+      {usage.saved ? (
+        <div className="usage-saved">
+          Laya saved ≈ {usage.saved.calls} calls, ${usage.saved.cost_usd.toFixed(2)} and{' '}
+          {Math.round(usage.saved.seconds / 60)} min vs. sending everything to the council
+        </div>
+      ) : (
+        <div className="usage-muted">Savings appear after the first council answer</div>
+      )}
+    </div>
+  );
+}
 
 export default function Sidebar({
   conversations,
   currentConversationId,
   onSelectConversation,
   onNewConversation,
+  usage,
 }) {
   return (
     <div className="sidebar">
@@ -38,6 +60,8 @@ export default function Sidebar({
           ))
         )}
       </div>
+
+      <UsageSummary usage={usage} />
     </div>
   );
 }
